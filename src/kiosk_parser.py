@@ -1,34 +1,36 @@
-"""Kiosk parser — scans the Ducat Kiosk inventory grid and returns price data for every
-visible item tile.
+"""Kiosk parser — OCR-scans a Ducat Kiosk screenshot and returns price data for every
+visible Prime part.
 
-The kiosk grid is a regular N-column × M-row layout of 160×160 px tiles (at 1080p).
-Each tile contains an item name at the bottom rendered in the active Warframe UI font
-(same colour scheme as fissure rewards). We:
-  1. Detect the grid region from known UI anchor colours.
-  2. Crop each tile's name region.
-  3. Run Tesseract OCR with the same whitelist/fuzzy matching already used for rewards.
-  4. Look up platinum + ducat data from the existing database.
+No grid detection. We OCR the full image, pull out every line that looks like a
+Prime part name, fuzzy-match it against the known item database, then return plat
+price, ducat value and recent sales volume for each unique hit.
 
-Falls back gracefully: if a tile name cannot be matched it is marked as unknown rather
-than crashing.
+Works regardless of resolution, window size, scroll position or screenshot format.
 
-Usage (standalone):
+Usage (standalone)::
+
     python kiosk_parser.py <screenshot_path>
 
-Output: JSON list of objects, one per detected tile, ordered left-to-right top-to-bottom.
-Each object::
+Output: JSON list of objects, one per detected unique item, ordered by appearance::
+
     {
-        "name": str,
-        "price": {"platinum": float, "ducats": int},
-        "sold": {"today": int, "yesterday": int},
-        "vaulted": bool | "partial",
-        "recommendation": "plat" | "ducats" | "either",
-        "row": int,
-        "col": int
+        "name":           str,          # canonical item name from db
+        "raw":            str,          # what OCR actually read
+        "price": {
+            "platinum":   float,
+            "ducats":     int
+        },
+        "sold": {
+            "today":      int,
+            "yesterday":  int
+        },
+        "vaulted":        bool | "partial",
+        "recommendation": "plat" | "ducats" | "either"
     }
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -36,87 +38,173 @@ import Levenshtein as lev
 import numpy as np
 import PIL.Image as Img
 from PIL.Image import Image
+from PIL import ImageEnhance, ImageFilter
 from platformdirs import user_cache_path
-from tesserocr import PyTessBaseAPI
+from tesserocr import PyTessBaseAPI, PSM
 
 import database as db
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants (all at 1080p; scaled at runtime)
+# Tesseract — full-page mode (PSM 6 = assume uniform block of text)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_TILE_SIZE        = 155
-_TILE_GAP         = 8
-_TILE_COLS        = 6
-_TILE_ROWS        = 4
-_NAME_HEIGHT      = 38
-_NAME_TOP_OFFSET  = 8
-
-_GRID_LEFT_1080   = 68
-_GRID_TOP_1080    = 152
-
-_NAME_COLOUR      = (178, 125, 5)
-
-_SAVE_DIR = user_cache_path("wfinfo") / "images"
-_SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
-tess = PyTessBaseAPI(
+_tess = PyTessBaseAPI(
     path="/usr/share/tessdata",
-    psm=7,
+    psm=PSM.SINGLE_BLOCK,
     variables={"tessedit_char_whitelist": db.whitelist_chars},
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Known OCR substitution table — common single-word misreads
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _scale(image: Image) -> float:
-    return (
-        image.height / 1080
-        if image.width / image.height > 16 / 9
-        else image.width / 1920
-    )
+_SUBSTITUTIONS: dict[str, str] = {
+    # letter confusion
+    "Recelver":   "Receiver",
+    "Recetver":   "Receiver",
+    "Recelver":   "Receiver",
+    "Blucprint":  "Blueprint",
+    "Bluepnint":  "Blueprint",
+    "Blueprlnt":  "Blueprint",
+    "Neuroptics": "Neuroptics",  # keep for safety
+    "Neumoptics": "Neuroptics",
+    "Neuroptlcs": "Neuroptics",
+    "Neuroplics": "Neuroptics",
+    "Systerns":   "Systems",
+    "Systcms":    "Systems",
+    "Chassls":    "Chassis",
+    "Chassi":     "Chassis",
+    "Harnoss":    "Harness",
+    "Banel":      "Barrel",
+    "Barrol":     "Barrel",
+    "Slring":     "String",
+    "Slnng":      "String",
+    "Stoclk":     "Stock",
+    "Stoek":      "Stock",
+    "Gnip":       "Grip",
+    "Llnk":       "Link",
+    "Llnk":       "Link",
+    "Prirne":     "Prime",
+    "Prlme":      "Prime",
+    "Pnme":       "Prime",
+    # number/letter confusion in item names
+    "Ak8olto":    "Akbolto",
+    "Akb0lto":    "Akbolto",
+    "Aks1iletto": "Akstiletto",
+    "Baz4":       "Baza",
+}
+
+# Regex: a line must contain "Prime" (case-insensitive) and be plausible length
+_PRIME_RE = re.compile(r"\bPr[il1]me\b", re.IGNORECASE)
+
+# Characters that can never appear in item names — used to strip OCR noise
+_NOISE_RE = re.compile(r"[^A-Za-z2 ]")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Image pre-processing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _preprocess(image: Image) -> Image:
+    """Convert to greyscale, boost contrast, upscale 2× for better OCR on small text."""
+    img = image.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(2.5)
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.resize((img.width * 2, img.height * 2), Img.LANCZOS)
+    return img
 
 
-def _strip_name(img: Image) -> Image:
-    arr = np.array(img)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+# ──────────────────────────────────────────────────────────────────────────────
+# OCR + line extraction
+# ──────────────────────────────────────────────────────────────────────────────
 
-    def _close(channel, target, tol=0.25):
-        lo = max(0, target * (1 - tol))
-        hi = min(255, target * (1 + tol))
-        return (channel >= lo) & (channel <= hi)
-
-    cr, cg, cb = _NAME_COLOUR
-    mask = _close(r, cr) & _close(g, cg) & _close(b, cb)
-
-    out = np.ones_like(arr) * 255
-    out[mask] = [0, 0, 0]
-    return Img.fromarray(out.astype("uint8"))
+def _ocr_full(image: Image) -> str:
+    """Run Tesseract on the full pre-processed image, return raw text."""
+    _tess.SetImage(image)
+    return _tess.GetUTF8Text()
 
 
-def _ocr_name(img: Image) -> str:
-    tess.SetImage(img)
-    raw = tess.GetUTF8Text().strip()
+def _clean_line(line: str) -> str:
+    """Strip noise characters and apply substitution table to every word."""
+    line = _NOISE_RE.sub(" ", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    words = []
+    for word in line.split():
+        words.append(_SUBSTITUTIONS.get(word, word))
+    return " ".join(words)
 
-    for bad, good in {"Recelver": "Receiver", "Blucprint": "Blueprint"}.items():
-        raw = raw.replace(bad, good)
 
-    checked = []
-    for word in raw.split():
+def _extract_candidates(raw_text: str) -> list[str]:
+    """Return cleaned lines from raw OCR text that look like Prime part names."""
+    candidates = []
+    for line in raw_text.splitlines():
+        if not _PRIME_RE.search(line):
+            continue
+        cleaned = _clean_line(line)
+        # Must have at least 2 words and be a reasonable length
+        if len(cleaned.split()) >= 2 and 6 <= len(cleaned) <= 60:
+            candidates.append(cleaned)
+    return candidates
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fuzzy matching against database
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _match_item(raw_name: str) -> tuple[str | None, float]:
+    """
+    Try to match raw_name to a known db item.
+
+    Strategy (in order):
+      1. Exact match (fast path)
+      2. Word-level Levenshtein — correct each word independently, then
+         try to assemble a known item name from the corrected words.
+      3. Full-string Levenshtein against all db item names (slow fallback,
+         only reached when word-level assembly fails).
+
+    Returns (canonical_name, confidence) or (None, 0.0).
+    """
+    # 1. Exact
+    if raw_name in db.items:
+        return raw_name, 1.0
+
+    # 2. Word-level correction
+    corrected_words = []
+    for word in raw_name.split():
         if word in db.words:
-            checked.append(word)
-        else:
-            best_ratio, best_word = 0.0, None
-            for w in db.words:
-                ratio = lev.ratio(word, w, score_cutoff=0.8)
-                if ratio > best_ratio:
-                    best_ratio, best_word = ratio, w
-            if best_word:
-                checked.append(best_word)
+            corrected_words.append(word)
+            continue
+        best_r, best_w = 0.0, None
+        for w in db.words:
+            r = lev.ratio(word, w, score_cutoff=0.75)
+            if r > best_r:
+                best_r, best_w = r, w
+        corrected_words.append(best_w if best_w else word)
 
-    return " ".join(checked)
+    assembled = " ".join(corrected_words)
+    if assembled in db.items:
+        return assembled, 0.9
 
+    # Also try without trailing "Blueprint" in case OCR dropped it
+    if not assembled.endswith("Blueprint") and assembled + " Blueprint" in db.items:
+        return assembled + " Blueprint", 0.85
+
+    # 3. Full-string Levenshtein against all known item names (capped at top-3 chars ratio)
+    best_r, best_name = 0.0, None
+    for name in db.items:
+        if name == "updated":
+            continue
+        r = lev.ratio(raw_name, name, score_cutoff=0.70)
+        if r > best_r:
+            best_r, best_name = r, name
+    if best_name and best_r >= 0.70:
+        return best_name, best_r
+
+    return None, 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Recommendation logic
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _recommendation(price: dict) -> str:
     plat   = price.get("platinum", 0) or 0
@@ -129,6 +217,7 @@ def _recommendation(price: dict) -> str:
     if plat == 0:
         return "ducats"
 
+    # Rough conversion: ~0.15 plat per ducat at average kiosk rates
     ducat_plat_equiv = ducats * 0.15
     if ducat_plat_equiv > plat * 1.1:
         return "ducats"
@@ -138,87 +227,67 @@ def _recommendation(price: dict) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grid detection
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _detect_grid_bounds(image: Image, scale: float):
-    tile_step = (_TILE_SIZE + _TILE_GAP) * scale
-    grid_left = _GRID_LEFT_1080 * scale
-    grid_top  = _GRID_TOP_1080  * scale
-
-    kiosk_right = 1005 * scale
-    n_cols = 0
-    while grid_left + (n_cols + 1) * tile_step - _TILE_GAP * scale <= kiosk_right:
-        n_cols += 1
-        if n_cols >= _TILE_COLS:
-            break
-
-    kiosk_bottom = 752 * scale
-    n_rows = 0
-    while grid_top + (n_rows + 1) * tile_step - _TILE_GAP * scale <= kiosk_bottom:
-        n_rows += 1
-        if n_rows >= _TILE_ROWS:
-            break
-
-    return int(grid_left), int(grid_top), max(1, n_cols), max(1, n_rows)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Main public function
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_kiosk(image: Image) -> list[dict]:
-    scale = _scale(image)
-    tile_px      = int(_TILE_SIZE * scale)
-    tile_step    = int((_TILE_SIZE + _TILE_GAP) * scale)
-    name_h       = int(_NAME_HEIGHT * scale)
-    name_top_off = int(_NAME_TOP_OFFSET * scale)
+    """
+    Parse a Ducat Kiosk screenshot and return pricing data for every visible item.
 
-    grid_left, grid_top, n_cols, n_rows = _detect_grid_bounds(image, scale)
+    Args:
+        image: PIL Image of the kiosk screen (any resolution, RGB or greyscale).
 
-    results = []
-    for row in range(n_rows):
-        for col in range(n_cols):
-            tx = grid_left + col * tile_step
-            ty = grid_top  + row * tile_step
+    Returns:
+        List of dicts, one per unique matched item, ordered by first appearance.
+        Items that OCR found but could not match are included with zeroed prices
+        and raw=<what OCR read> so you can see what went wrong.
+    """
+    processed = _preprocess(image)
+    raw_text  = _ocr_full(processed)
+    candidates = _extract_candidates(raw_text)
 
-            name_box = (
-                tx,
-                ty + tile_px - name_h - name_top_off,
-                tx + tile_px,
-                ty + tile_px - name_top_off,
-            )
+    results: list[dict] = []
+    seen:    set[str]   = set()
 
-            name_crop = image.crop(name_box)
-            stripped  = _strip_name(name_crop)
-            name      = _ocr_name(stripped)
+    for raw_name in candidates:
+        canonical, confidence = _match_item(raw_name)
 
-            if not name:
-                continue
-
-            if name in db.items:
-                item = db.items[name]
-                entry = {
-                    "name":           name,
-                    "price":          item["price"],
-                    "sold":           item.get("sold", {"today": 0, "yesterday": 0}),
-                    "vaulted":        item.get("vaulted", False),
-                    "recommendation": _recommendation(item["price"]),
-                    "row":            row,
-                    "col":            col,
-                }
-            else:
-                entry = {
-                    "name":           name,
+        # Skip low-confidence / duplicate matches
+        if canonical is None or confidence < 0.70:
+            # Still include as unknown so the caller can see OCR output
+            key = raw_name.lower()
+            if key not in seen:
+                seen.add(key)
+                results.append({
+                    "name":           raw_name,
+                    "raw":            raw_name,
+                    "matched":        False,
+                    "confidence":     round(confidence, 3),
                     "price":          {"platinum": 0, "ducats": 0},
                     "sold":           {"today": 0, "yesterday": 0},
                     "vaulted":        False,
                     "recommendation": "either",
-                    "row":            row,
-                    "col":            col,
-                }
+                })
+            continue
 
-            results.append(entry)
+        key = canonical.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        item = db.items.get(canonical, {})
+        price = item.get("price", {"platinum": 0, "ducats": 0})
+
+        results.append({
+            "name":           canonical,
+            "raw":            raw_name,
+            "matched":        True,
+            "confidence":     round(confidence, 3),
+            "price":          price,
+            "sold":           item.get("sold", {"today": 0, "yesterday": 0}),
+            "vaulted":        item.get("vaulted", False),
+            "recommendation": _recommendation(price),
+        })
 
     return results
 
@@ -229,7 +298,29 @@ def parse_kiosk(image: Image) -> list[dict]:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python kiosk_parser.py <screenshot.png>")
+        print("Usage: python kiosk_parser.py <screenshot.png|jpg>")
         sys.exit(1)
-    with Img.open(sys.argv[1]).convert("RGB") as img:
-        print(json.dumps(parse_kiosk(img), indent=2))
+
+    path = Path(sys.argv[1])
+    if not path.exists():
+        print(f"File not found: {path}")
+        sys.exit(1)
+
+    with Img.open(path).convert("RGB") as img:
+        results = parse_kiosk(img)
+
+    if not results:
+        print("No Prime items detected. Check the screenshot contains the kiosk grid.")
+        sys.exit(1)
+
+    matched   = [r for r in results if r["matched"]]
+    unmatched = [r for r in results if not r["matched"]]
+
+    print(json.dumps(results, indent=2))
+    print(f"\n── Summary ──────────────────────────────────")
+    print(f"  Matched:   {len(matched)}")
+    print(f"  Unmatched: {len(unmatched)}")
+    if unmatched:
+        print(f"  Unmatched raw OCR lines:")
+        for u in unmatched:
+            print(f"    · '{u['raw']}'")

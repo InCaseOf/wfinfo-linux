@@ -7,7 +7,7 @@ This is a limited remake of [wfinfo](https://wfinfo.warframestat.us) in Python a
 -   Supports Wayland
 -   Detect rewards screen (inconsistent)
 -   Manual trigger detection
--   Global keybind (Hyprland only)
+-   Global keybind (Hyprland only; see [Niri setup](#niri-setup) for manual keybind instructions)
 -   Display price and volume stats for items
 -   Overlay (like steam overlay)
 -   Relic view with price data
@@ -28,7 +28,7 @@ This is a limited remake of [wfinfo](https://wfinfo.warframestat.us) in Python a
 -   `dart-sass` - for compiling GUI styles
 -   `grim` - for screenshots
 -   `wlr-randr` - for getting active monitor for screenshots
--   `wmctrl` - for WM/DE detection
+-   `wmctrl` - for WM/DE detection on X11 (not required on Hyprland or Niri)
 -   `fish` - for `wfinfo` script
 
 > [!TIP]
@@ -51,7 +51,7 @@ when the buffer is full, the auto detection may be inconsistent.
 
 The reward display can be manually triggered while running via `wfinfo -t`. If on Hyprland, the program will
 automatically create a shortcut for the trigger script (`F2` by default) on start. This WILL remove any prior binds
-for that key. Otherwise, just create a keybind manually depending on your DE.
+for that key. Otherwise, just create a keybind manually depending on your DE/compositor.
 
 The overlay can be toggled with `F3` (if on Hyprland, otherwise set the shortcut manually). All keybinds can be changed
 in `ags/config.user.js`.
@@ -60,16 +60,82 @@ in `ags/config.user.js`.
 
 Configuration is in `ags/config.user.js`. Read the comments in the file for how to configure.
 
+## Niri Setup
+
+Niri is a pure Wayland scrollable-tiling compositor and is fully supported for screen capture. However, Niri does not
+allow dynamic keybind injection via CLI (unlike Hyprland's `hyprctl`), so keybinds must be added manually.
+
+When you start `wfinfo`, it will detect Niri via the `NIRI_SOCKET` environment variable and print the exact keybind
+lines to add to your config instead of trying to create them automatically.
+
+Add the following to the `binds` section of `~/.config/niri/config.kdl`:
+
+```kdl
+binds {
+    // ... your other binds ...
+
+    // Trigger WFInfo manual OCR detection
+    Mod+F2 { spawn "/path/to/wfinfo" "-t"; }
+    // Toggle WFInfo overlay
+    Mod+F3 { spawn "/path/to/wfinfo" "-g"; }
+}
+```
+
+Replace `/path/to/wfinfo` with the actual path to the `wfinfo` script (e.g. `~/.local/bin/wfinfo` if you symlinked it).
+
+After editing, reload your Niri config:
+
+```bash
+niri msg action reload-config
+```
+
+## GeForce NOW / No Local EE.log
+
+If you are playing Warframe via **GeForce NOW** (or any setup where Warframe is not installed locally), there is no
+`EE.log` file on your machine. In this case:
+
+1. Create a dummy empty log file:
+   ```bash
+   touch ~/dummy_EE.log
+   ```
+2. Edit `ags/config.user.js` and update `logPath` to point to the dummy file:
+   ```js
+   export const logPath = `${Utils.HOME}/dummy_EE.log`;
+   ```
+3. Make sure `autodetect` is set to `false` (it is by default):
+   ```js
+   export const autodetect = false;
+   ```
+4. Start the program normally:
+   ```bash
+   wfinfo
+   ```
+5. When the relic reward screen appears in your GeForce NOW stream, manually trigger the OCR via your keybind
+   (`Mod+F2` on Niri, `F2` on Hyprland) or from the terminal:
+   ```bash
+   wfinfo -t
+   ```
+
+> [!NOTE]
+> Auto detection does not work with GeForce NOW since the `EE.log` is generated on Nvidia's cloud servers,
+> not your local machine. Manual trigger only.
+
 ## FAQ
 
 **Q: What if my `EE.log` file is in a different location?**
 
 **A:** The default location is set in `ags/config.user.js`, but you can change it to whatever value you like in that
 file. If the file is not in the default location, the program will try to search for it in your home directory.
+If you don't have a local Warframe install (e.g. GeForce NOW), see [GeForce NOW / No Local EE.log](#geforce-now--no-local-eelog).
 
 **Q: How can I change the keybind for manually triggering the detection?**
 
-**A:** Look in `ags/config.user.js`.
+**A:** Look in `ags/config.user.js`. On Niri, also update `~/.config/niri/config.kdl` manually.
+
+**Q: Does this work on Niri?**
+
+**A:** Yes. WM detection uses `NIRI_SOCKET` / `XDG_CURRENT_DESKTOP` env vars rather than `wmctrl`, which doesn't
+work on pure Wayland compositors. See [Niri Setup](#niri-setup) for keybind configuration.
 
 **Q: Does this work with a multi-monitor setup?**
 

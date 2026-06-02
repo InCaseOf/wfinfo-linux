@@ -1,4 +1,4 @@
-"""Kiosk parser — OCR-scans a Ducat Kiosk screenshot and returns price data for every
+"""Kiosk parser -- OCR-scans a Ducat Kiosk screenshot and returns price data for every
 visible Prime part.
 
 Strategy: instead of OCR-ing the full image (which causes item art to be read as
@@ -48,9 +48,10 @@ from tesserocr import PyTessBaseAPI, PSM
 
 import database as db
 
-# ──────────────────────────────────────────────────────────────────────────────
-Tesseract
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Tesseract
+# ---------------------------------------------------------------------------
 
 _tess = PyTessBaseAPI(
     path="/usr/share/tessdata",
@@ -58,9 +59,10 @@ _tess = PyTessBaseAPI(
     variables={"tessedit_char_whitelist": db.whitelist_chars},
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-OCR substitution table
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# OCR substitution table
+# ---------------------------------------------------------------------------
 
 _SUBSTITUTIONS: dict[str, str] = {
     "Recelver":   "Receiver",
@@ -96,9 +98,10 @@ _SUBSTITUTIONS: dict[str, str] = {
 _PRIME_RE = re.compile(r"\bPr[il1]me\b", re.IGNORECASE)
 _NOISE_RE = re.compile(r"[^A-Za-z2 ]")
 
-# ──────────────────────────────────────────────────────────────────────────────
-Grid geometry detection
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Grid geometry detection
+# ---------------------------------------------------------------------------
 
 def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
     """Return (start, end) pairs for contiguous True runs in a 1-D boolean array."""
@@ -120,7 +123,6 @@ def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
 def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
     """
     Find horizontal bands containing item name labels (white text on dark bg).
-
     All thresholds scale with image height so detection works at any resolution.
     """
     h = arr.shape[0]
@@ -141,7 +143,7 @@ def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple
         else:
             merged.append([s, e])
 
-    # Drop UI chrome (top 30 %) and thin artefacts (< h*0.01 tall)
+    # Drop UI chrome (top 30%) and thin artefacts (< h*0.01 tall)
     min_height = max(10, int(h * 0.01))
     return [
         (s, e) for s, e in merged
@@ -151,11 +153,7 @@ def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple
 
 def _detect_tile_cols(arr: np.ndarray, row_y1: int, row_y2: int,
                       grid_x1: int, grid_x2: int) -> list[int]:
-    """
-    Find vertical tile column boundaries within a name-label row.
-
-    Min tile width scales with image width so we don't split on sub-pixel noise.
-    """
+    """Find vertical tile column boundaries within a name-label row."""
     w = arr.shape[1]
     region = arr[row_y1:row_y2, grid_x1:grid_x2, :]
     white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
@@ -163,9 +161,8 @@ def _detect_tile_cols(arr: np.ndarray, row_y1: int, row_y2: int,
 
     gap_runs = _find_runs(white_per_col < 0.05, min_run=3)
 
-    # Min tile width: ~50px at 1080p, ~130px at 2560p (tiles are ~w*0.08 wide)
+    # Min tile width scales with resolution (~50px at 1080p, ~130px at 2560p)
     min_tile_w = max(50, int(w * 0.05))
-
     dividers = [grid_x1]
     for gs, ge in gap_runs:
         mid = grid_x1 + (gs + ge) // 2
@@ -182,12 +179,12 @@ def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
     return int(w * 0.023), int(w * 0.517)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-Image pre-processing
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Image pre-processing
+# ---------------------------------------------------------------------------
 
 def _preprocess_tile(crop: Image) -> Image:
-    """3× upscale + hard binarise for clean PSM.SINGLE_LINE OCR."""
+    """3x upscale + hard binarise for clean PSM.SINGLE_LINE OCR."""
     w, h = crop.size
     crop = crop.resize((w * 3, h * 3), Img.LANCZOS)
     gray = np.array(crop.convert("L"))
@@ -195,18 +192,18 @@ def _preprocess_tile(crop: Image) -> Image:
     return Img.fromarray(binary)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-OCR
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# OCR
+# ---------------------------------------------------------------------------
 
 def _ocr_tile(tile_img: Image) -> str:
     _tess.SetImage(tile_img)
     return _tess.GetUTF8Text().strip()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-Text cleaning
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Text cleaning
+# ---------------------------------------------------------------------------
 
 def _clean_line(line: str) -> str:
     line = _NOISE_RE.sub(" ", line)
@@ -214,9 +211,9 @@ def _clean_line(line: str) -> str:
     return " ".join(_SUBSTITUTIONS.get(w, w) for w in line.split())
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-Fuzzy matching
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Fuzzy matching
+# ---------------------------------------------------------------------------
 
 def _match_item(raw_name: str) -> tuple[str | None, float]:
     if raw_name in db.items:
@@ -253,9 +250,9 @@ def _match_item(raw_name: str) -> tuple[str | None, float]:
     return None, 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-Recommendation
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Recommendation
+# ---------------------------------------------------------------------------
 
 def _recommendation(price: dict) -> str:
     plat   = price.get("platinum", 0) or 0
@@ -274,11 +271,12 @@ def _recommendation(price: dict) -> str:
     return "either"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-Main public function
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main public function
+# ---------------------------------------------------------------------------
 
 def parse_kiosk(image: Image) -> list[dict]:
+    """Parse a Ducat Kiosk screenshot and return pricing data for every visible item."""
     img_rgb = image.convert("RGB")
     arr = np.array(img_rgb)
 
@@ -344,9 +342,9 @@ def parse_kiosk(image: Image) -> list[dict]:
     return results
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-CLI entry-point
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CLI entry-point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -369,10 +367,10 @@ if __name__ == "__main__":
     unmatched = [r for r in results if not r["matched"]]
 
     print(json.dumps(results, indent=2))
-    print(f"\n── Summary ──────────────────────────────────")
+    print(f"\n-- Summary ----------------------------------")
     print(f"  Matched:   {len(matched)}")
     print(f"  Unmatched: {len(unmatched)}")
     if unmatched:
         print(f"  Unmatched raw OCR lines:")
         for u in unmatched:
-            print(f"    · '{u['raw']}'")
+            print(f"    . '{u['raw']}'")

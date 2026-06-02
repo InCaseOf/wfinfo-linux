@@ -5,12 +5,15 @@ Detection strategy:
   1. Find inter-row separator bands: rows where the full grid width is nearly all
      dark (lum < 8 across >90% of pixels). These are the black strips between tile rows.
   2. Tile rows = the spans between those separator bands (filter < 50px tall).
-  3. Name label crop = bottom 85px (scaled) of each tile row. Names are bottom-aligned.
+  3. Name label crop = bottom NAME_H_PX pixels of each tile row (fixed pixel count,
+     scaled by DPI factor). Names are bottom-aligned; fixed px works better than a
+     fraction because the tile height grows but text height stays proportional to DPI.
   4. 6 fixed equal-width columns (Warframe kiosk is always 6-wide).
   5. Binarize on luminance > 100 (text is warm grey ~lum 156, not pure white).
   6. OCR with Tesseract PSM.SINGLE_LINE at 3x upscale.
 
-All geometry scales with image dimensions for resolution independence.
+Grid x2 boundary is resolution-specific because the right panel + scrollbar have
+fixed-pixel widths that do not scale proportionally.
 
 Usage::
 
@@ -96,9 +99,19 @@ _NOISE_RE = re.compile(r"[^A-Za-z2 ]")
 # Warframe kiosk always shows exactly 6 columns
 _KIOSK_COLS = 6
 
-# Name label sits in the bottom N pixels of each tile (bottom-aligned text)
-# Scales with image height: ~85px at 1080p, ~113px at 1440p
-_NAME_BOTTOM_FRAC = 0.079   # 85/1080
+# Grid x2 as a fraction of image width, keyed by image HEIGHT.
+# The right panel + scrollbar have fixed pixel widths, so the fraction differs
+# between resolutions. Unknown resolutions fall back to 0.520.
+_GRID_X2_FRAC: dict[int, float] = {
+    1080: 0.531,   # 1020 / 1920  (confirmed)
+    1440: 0.517,   # 1323 / 2560  (confirmed)
+    2160: 0.520,   # 3840x2160 estimate
+}
+_GRID_X2_FALLBACK = 0.520
+
+# Name label height at 1080p reference, in pixels.
+# Scales linearly with image height (DPI factor).
+_NAME_H_1080 = 85
 
 
 # ---------------------------------------------------------------------------
@@ -126,21 +139,15 @@ def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
     """
     Return (grid_x1, grid_x2): the horizontal extent of the item grid.
 
-    Scans for the rightmost near-full-height dark vertical column (left panel
-    boundary) and uses fixed ~2.3% for the left edge.
+    x1 is fixed at ~2.3% of width (left UI chrome is consistent).
+    x2 uses a per-resolution lookup table because the right panel and scrollbar
+    have fixed pixel widths that don't scale proportionally.
     """
     h, w = arr.shape[:2]
     x1 = int(w * 0.023)
-
-    # Right boundary: find rightmost column that is mostly dark in the grid region
-    scan_y = slice(int(h * 0.15), int(h * 0.85))
-    for x in range(int(w * 0.58), int(w * 0.30), -1):
-        col = arr[scan_y, x, :]
-        lum = 0.299 * col[:, 0] + 0.587 * col[:, 1] + 0.114 * col[:, 2]
-        if (lum < 40).mean() > 0.85:
-            return x1, x
-
-    return x1, int(w * 0.517)  # fallback
+    frac = _GRID_X2_FRAC.get(h, _GRID_X2_FALLBACK)
+    x2 = int(w * frac)
+    return x1, x2
 
 
 def _detect_tile_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
@@ -151,7 +158,6 @@ def _detect_tile_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple
     grid width -- a much more reliable signal than text density.
     """
     h = arr.shape[0]
-    grid_w = grid_x2 - grid_x1
 
     row_dark = np.array([
         (
@@ -194,6 +200,11 @@ def _tile_x_bounds(grid_x1: int, grid_x2: int, w: int) -> list[tuple[int, int]]:
          int(grid_x1 + (i + 1) * tile_w) - inset)
         for i in range(_KIOSK_COLS)
     ]
+
+
+def _name_h(image_h: int) -> int:
+    """Name label crop height in pixels, scaled from the 1080p reference value."""
+    return max(60, round(_NAME_H_1080 * image_h / 1080))
 
 
 # ---------------------------------------------------------------------------
@@ -306,15 +317,13 @@ def parse_kiosk(image: Image) -> list[dict]:
     grid_x1, grid_x2 = _infer_grid_x(arr)
     tile_rows = _detect_tile_rows(arr, grid_x1, grid_x2)
     tile_cols = _tile_x_bounds(grid_x1, grid_x2, w)
-
-    # Name label height: bottom N px of each tile (scales with resolution)
-    name_h = max(60, int(h * _NAME_BOTTOM_FRAC))
+    nh = _name_h(h)
 
     results: list[dict] = []
     seen:    set[str]   = set()
 
     for ry1, ry2 in tile_rows:
-        name_y1 = ry2 - name_h
+        name_y1 = ry2 - nh
         name_y2 = ry2
 
         for tx1, tx2 in tile_cols:

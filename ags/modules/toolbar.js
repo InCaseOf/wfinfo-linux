@@ -33,6 +33,22 @@ const WindowButton = (window, icon, tooltip) =>
         },
     });
 
+const KioskButton = () =>
+    Button({
+        className: "toolbar-button",
+        tooltipText: "Scan Ducat Kiosk (F4)",
+        child: Label({ className: "icon-material", label: "currency_exchange" }),
+        onClicked: () => triggerKiosk(),
+        setup: self => {
+            setupCursorHover(self);
+            // Light up when kiosk window is open
+            self.hook(App, (self, name, visible) => {
+                if (name === "wfinfo-kiosk")
+                    self.toggleClassName("toolbar-button-active", visible);
+            });
+        },
+    });
+
 const Toolbar = () =>
     Box({
         className: "toolbar",
@@ -40,7 +56,11 @@ const Toolbar = () =>
             DragArea(),
             Box({
                 homogeneous: true,
-                children: [OverlayButton(), WindowButton("wfinfo-relics", "relic", "Relic View")],
+                children: [
+                    OverlayButton(),
+                    WindowButton("wfinfo-relics", "relic", "Relic View"),
+                    KioskButton(),
+                ],
             }),
         ],
     });

@@ -4,6 +4,7 @@
 // to the terminal telling you what to add to ~/.config/niri/config.kdl.
 export const keybinds = {
     fissure: ",F2", // Trigger manual fissure reward detection
+    kiosk:   ",F4", // Trigger Ducat Kiosk scan
     gui: {
         toggle: ",F3", // Toggle gui overlay
     },

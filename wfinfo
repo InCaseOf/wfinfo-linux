@@ -5,10 +5,11 @@ cd (dirname (realpath (status filename))) || exit
 set script_name (basename (status filename))
 count $argv >/dev/null || set no_args
 
-argparse -n $script_name -X 0 -x 'h,q,t,g,reload-css,update-dbs' \
+argparse -n $script_name -X 0 -x 'h,q,t,k,g,reload-css,update-dbs' \
     'h/help' \
     'q/quit' \
     't/trigger' \
+    'k/kiosk' \
     'g/toggle-gui' \
     'reload-css' \
     'update-dbs' \
@@ -21,6 +22,7 @@ if set -q _flag_h
     echo '    '$script_name' (-h | --help)'
     echo '    '$script_name' (-q | --quit)'
     echo '    '$script_name' (-t | --trigger)'
+    echo '    '$script_name' (-k | --kiosk)'
     echo '    '$script_name' (-g | --toggle-gui)'
     echo '    '$script_name' --reload-css'
     echo '    '$script_name' --update-dbs'
@@ -29,6 +31,7 @@ if set -q _flag_h
     echo '    -h, --help            Print this help message and exit'
     echo '    -q, --quit            Quit the application'
     echo '    -t, --trigger         Trigger manual fissure rewards detection'
+    echo '    -k, --kiosk           Trigger Ducat Kiosk scan'
     echo '    -g, --toggle-gui      Toggle GUI overlay layers'
     echo '    --reload-css          Reload GUI styles'
     echo '    --update-dbs          Update relic, item and price databases'
@@ -64,6 +67,10 @@ end
 
 if set -q _flag_t
     run trigger
+end
+
+if set -q _flag_k
+    run triggerKiosk
 end
 
 if set -q _flag_g

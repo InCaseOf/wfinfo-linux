@@ -7,6 +7,7 @@ This is a limited remake of [wfinfo](https://wfinfo.warframestat.us) in Python a
 -   Supports Wayland
 -   Detect rewards screen (inconsistent)
 -   Manual trigger detection
+-   **Ducat Kiosk scanning** — scan visible kiosk items and see plat + ducat values side-by-side
 -   Global keybind (Hyprland only; see [Niri setup](#niri-setup) for manual keybind instructions)
 -   Display price and volume stats for items
 -   Overlay (like steam overlay)
@@ -56,6 +57,37 @@ for that key. Otherwise, just create a keybind manually depending on your DE/com
 The overlay can be toggled with `F3` (if on Hyprland, otherwise set the shortcut manually). All keybinds can be changed
 in `ags/config.user.js`.
 
+## Ducat Kiosk
+
+While standing at a Ducat Kiosk with the inventory screen open, press `F4` (or `Mod+F4` on Niri) to scan the
+currently visible grid of Prime parts. An overlay card will appear over each tile showing:
+
+-   **Platinum price** — current market average
+-   **Ducat value** — what Baro will give you
+-   **Sold volume** — last 24 h and last 48 h
+-   **Vaulted indicator** — whether the item is currently vaulted
+-   **Recommendation badge** — `Sell for plat`, `Sell for ducats`, or `Either`
+
+The overlay auto-closes after 20 seconds. You can also close it by pressing `F4` again or clicking the kiosk
+button in the toolbar.
+
+The recommendation heuristic uses a simple plat-per-ducat conversion: if ducats are worth more than ~15% of
+the plat price (i.e. good ducat value), it recommends ducats. If plat is noticeably higher, it recommends
+plat. Otherwise it says either.
+
+> [!NOTE]
+> Only the currently visible tiles are scanned — scroll down and trigger again to scan the next page.
+
+### Kiosk keybind on Niri
+
+Add the following to the `binds` section of `~/.config/niri/config.kdl`:
+
+```kdl
+Mod+F4 { spawn "/path/to/wfinfo" "-k"; }
+```
+
+Then run `niri msg action reload-config`.
+
 ## Configuration
 
 Configuration is in `ags/config.user.js`. Read the comments in the file for how to configure.
@@ -74,10 +106,12 @@ Add the following to the `binds` section of `~/.config/niri/config.kdl`:
 binds {
     // ... your other binds ...
 
-    // Trigger WFInfo manual OCR detection
+    // Trigger WFInfo manual fissure detection
     Mod+F2 { spawn "/path/to/wfinfo" "-t"; }
     // Toggle WFInfo overlay
     Mod+F3 { spawn "/path/to/wfinfo" "-g"; }
+    // Trigger Ducat Kiosk scan
+    Mod+F4 { spawn "/path/to/wfinfo" "-k"; }
 }
 ```
 
@@ -115,6 +149,10 @@ If you are playing Warframe via **GeForce NOW** (or any setup where Warframe is 
    ```bash
    wfinfo -t
    ```
+6. When at a Ducat Kiosk, trigger the kiosk scan (`Mod+F4` on Niri, `F4` on Hyprland) or:
+   ```bash
+   wfinfo -k
+   ```
 
 > [!NOTE]
 > Auto detection does not work with GeForce NOW since the `EE.log` is generated on Nvidia's cloud servers,
@@ -131,6 +169,19 @@ If you don't have a local Warframe install (e.g. GeForce NOW), see [GeForce NOW 
 **Q: How can I change the keybind for manually triggering the detection?**
 
 **A:** Look in `ags/config.user.js`. On Niri, also update `~/.config/niri/config.kdl` manually.
+
+**Q: How does the kiosk recommendation work?**
+
+**A:** It uses a simple heuristic: 1 ducat ≈ 0.15 plat equivalent on average. If the item's ducat value converted
+at that rate beats its plat price by more than 10%, it recommends ducats. If plat is more than 50% better than
+the ducat equivalent, it recommends plat. Otherwise it says either.
+
+**Q: The kiosk scan missed some tiles / got wrong names.**
+
+**A:** The kiosk grid layout is detected from known 1080p proportions and scaled. If your game is running at a
+non-16:9 aspect ratio or with UI scale changes, some tiles at the edges may not be detected. As a workaround,
+scroll to the missed tiles and trigger the scan again. Fuzzy OCR matching using Levenshtein distance corrects
+most small misreads.
 
 **Q: Does this work on Niri?**
 

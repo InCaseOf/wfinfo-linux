@@ -1,0 +1,120 @@
+@use "../lib/colour" as c;
+@use "../lib/rounding";
+@use "../lib/font";
+@use "../lib/anim";
+
+// ─── Outer panel ─────────────────────────────────────────────────────────────
+
+.kiosk-panel {
+    // Subtle dark-glass background over the kiosk UI
+    background-color: change-color(c.$background, $alpha: 0.0);
+    padding: 0;
+}
+
+.kiosk-row {
+    margin-bottom: 0.408rem;
+}
+
+// ─── Individual item card ─────────────────────────────────────────────────────
+
+.kiosk-card {
+    @include rounding.normal;
+    @include anim.element-decel;
+
+    background-color: change-color(c.$background, $alpha: 0.82);
+    color: c.$onBackground;
+    padding: 0.5rem 0.6rem;
+    margin-right: 0.408rem;
+    min-width: 9rem;
+    max-width: 10.5rem;
+}
+
+// ─── Item name ────────────────────────────────────────────────────────────────
+
+.kiosk-item-name {
+    @include font.title;
+    @include font.semibold;
+
+    font-size: 0.72rem;
+    margin-bottom: 0.272rem;
+}
+
+// ─── Price row ────────────────────────────────────────────────────────────────
+
+.kiosk-price {
+    @include font.title;
+    @include font.semibold;
+
+    font-size: 0.8rem;
+    margin-bottom: 0.272rem;
+
+    // Gap between plat and ducat
+    & > :first-child {
+        margin-right: 0.544rem;
+    }
+
+    // Gap between value and icon
+    & > * > :first-child {
+        margin-right: 0.2rem;
+    }
+}
+
+// ─── Sold volume ─────────────────────────────────────────────────────────────
+
+.kiosk-sold {
+    @include font.main;
+
+    font-size: 0.62rem;
+    color: c.$onBackground;
+    opacity: 0.7;
+    margin-bottom: 0.272rem;
+}
+
+// ─── Vaulted tag ─────────────────────────────────────────────────────────────
+
+.kiosk-vaulted {
+    @include font.small;
+
+    color: c.$onBackground;
+    opacity: 0.6;
+    margin-bottom: 0.2rem;
+}
+
+// ─── Recommendation badge ────────────────────────────────────────────────────
+
+.kiosk-rec {
+    @include font.small;
+    @include rounding.small;
+
+    font-size: 0.62rem;
+    padding: 0.1rem 0.36rem;
+    margin-top: 0.136rem;
+}
+
+.kiosk-rec-plat {
+    background-color: change-color(c.$primary, $alpha: 0.25);
+    color: c.$primary;
+}
+
+.kiosk-rec-ducats {
+    background-color: change-color(c.$secondary, $alpha: 0.25);
+    color: c.$secondary;
+}
+
+.kiosk-rec-either {
+    background-color: change-color(c.$onBackground, $alpha: 0.12);
+    color: c.$onBackground;
+    opacity: 0.7;
+}
+
+// ─── Loading / error states ───────────────────────────────────────────────────
+
+.kiosk-loading {
+    @include rounding.normal;
+    @include font.title;
+
+    background-color: change-color(c.$background, $alpha: 0.82);
+    color: c.$onBackground;
+    padding: 0.8rem 1.2rem;
+    font-size: 0.8rem;
+}

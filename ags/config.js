@@ -4,6 +4,7 @@ import { keybinds } from "./config.user.js";
 import { createKeybind, deleteKeybind } from "./lib/keybind.js";
 import { BIN_PATH, CACHE_DIR, info } from "./lib/misc.js";
 import FissureDisplay from "./modules/fissure_display.js";
+import KioskDisplay from "./modules/kiosk_display.js";
 import Overlay from "./modules/overlay.js";
 import RelicView from "./modules/relic_view.js";
 import Toolbar from "./modules/toolbar.js";
@@ -32,16 +33,18 @@ execAsync(`${BIN_PATH} --update-dbs`)
 App.addIcons(`${App.configDir}/assets/icons`);
 App.config({
     stackTraceOnError: true,
-    windows: [FissureDisplay(), Overlay(), Toolbar(), RelicView()],
+    windows: [FissureDisplay(), Overlay(), Toolbar(), RelicView(), KioskDisplay()],
 });
 
 //////////////// Keybind stuff
 createKeybind(keybinds.fissure, `${BIN_PATH} -t`, false);
 createKeybind(keybinds.gui?.toggle, `${BIN_PATH} -g`);
+createKeybind(keybinds.kiosk, `${BIN_PATH} -k`, false);
 
 const deleteKeybinds = () => {
     deleteKeybind(keybinds.fissure);
     deleteKeybind(keybinds.gui?.toggle);
+    deleteKeybind(keybinds.kiosk);
 };
 // Handle SIGINT
 GLibUnix.signal_add_full(GLib.PRIORITY_DEFAULT, 2, App.quit);
@@ -49,7 +52,7 @@ GLibUnix.signal_add_full(GLib.PRIORITY_DEFAULT, 2, App.quit);
 App.connect("shutdown", deleteKeybinds);
 
 //////////////// Window toggle stuff
-const ignoredWindows = ["wfinfo-fissure"];
+const ignoredWindows = ["wfinfo-fissure", "wfinfo-kiosk"];
 const connectWindows = () =>
     App.connect("window-toggled", (_, name, visible) => {
         if (!ignoredWindows.includes(name)) windowsOpen[name] = visible;

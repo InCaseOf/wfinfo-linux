@@ -8,8 +8,8 @@ garbage text), we:
   2. Detect vertical tile column boundaries using the same method.
   3. OCR each individual tile name crop with PSM.SINGLE_LINE at 3x upscale.
 
-This works at any resolution and scroll position because the detection is
-pixel-density based, not hard-coded coordinates.
+All geometry thresholds are expressed as fractions of image dimensions so the
+detection works at any resolution (1080p, 1440p, 4K, ultrawide, etc.).
 
 Usage (standalone)::
 
@@ -18,8 +18,10 @@ Usage (standalone)::
 Output: JSON list of objects, one per detected unique item, ordered by appearance::
 
     {
-        "name":           str,          # canonical item name from db
-        "raw":            str,          # what OCR actually read
+        "name":           str,
+        "raw":            str,
+        "matched":        bool,
+        "confidence":     float,
         "price": {
             "platinum":   float,
             "ducats":     int
@@ -47,7 +49,7 @@ from tesserocr import PyTessBaseAPI, PSM
 import database as db
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tesseract — single-line mode for per-tile name crops
+Tesseract
 # ──────────────────────────────────────────────────────────────────────────────
 
 _tess = PyTessBaseAPI(
@@ -57,7 +59,7 @@ _tess = PyTessBaseAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Known OCR substitution table — common single-word misreads
+OCR substitution table
 # ──────────────────────────────────────────────────────────────────────────────
 
 _SUBSTITUTIONS: dict[str, str] = {
@@ -95,7 +97,7 @@ _PRIME_RE = re.compile(r"\bPr[il1]me\b", re.IGNORECASE)
 _NOISE_RE = re.compile(r"[^A-Za-z2 ]")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grid geometry detection
+Grid geometry detection
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
@@ -119,29 +121,31 @@ def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple
     """
     Find horizontal bands containing item name labels (white text on dark bg).
 
-    Filters out:
-      - The top 25 % of the image (UI chrome: title bar, sort controls)
-      - Any band shorter than 10 px (quantity badges, thin decorations)
+    All thresholds scale with image height so detection works at any resolution.
     """
     h = arr.shape[0]
     region = arr[:, grid_x1:grid_x2, :]
     white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
     norm = white.sum(axis=1).astype(float) / (grid_x2 - grid_x1)
 
-    raw_runs = _find_runs(norm > 0.04, min_run=8)
+    # min_run scales with height: ~8px at 1080p, ~11px at 1440p
+    min_run = max(6, int(h * 0.007))
+    raw_runs = _find_runs(norm > 0.04, min_run=min_run)
 
-    # Merge runs within 15 px (handles two-line item names)
+    # Merge runs within h*0.04 px (handles two-line names at any resolution)
+    merge_gap = int(h * 0.04)
     merged: list[list[int]] = []
     for s, e in raw_runs:
-        if merged and s - merged[-1][1] <= 15:
+        if merged and s - merged[-1][1] <= merge_gap:
             merged[-1][1] = e
         else:
             merged.append([s, e])
 
-    # Drop UI chrome (top 25 %) and thin artefacts (< 10 px tall)
+    # Drop UI chrome (top 30 %) and thin artefacts (< h*0.01 tall)
+    min_height = max(10, int(h * 0.01))
     return [
         (s, e) for s, e in merged
-        if s > h * 0.25 and (e - s) >= 10
+        if s > h * 0.30 and (e - s) >= min_height
     ]
 
 
@@ -150,35 +154,36 @@ def _detect_tile_cols(arr: np.ndarray, row_y1: int, row_y2: int,
     """
     Find vertical tile column boundaries within a name-label row.
 
-    Tile separators are narrow dark gaps (<5 % white in that column slice).
-    Returns sorted x-coordinates including the outer left/right edges.
+    Min tile width scales with image width so we don't split on sub-pixel noise.
     """
+    w = arr.shape[1]
     region = arr[row_y1:row_y2, grid_x1:grid_x2, :]
     white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
     white_per_col = white.sum(axis=0).astype(float) / max(row_y2 - row_y1, 1)
 
     gap_runs = _find_runs(white_per_col < 0.05, min_run=3)
 
+    # Min tile width: ~50px at 1080p, ~130px at 2560p (tiles are ~w*0.08 wide)
+    min_tile_w = max(50, int(w * 0.05))
+
     dividers = [grid_x1]
     for gs, ge in gap_runs:
         mid = grid_x1 + (gs + ge) // 2
-        if mid - dividers[-1] > 50:   # ignore slivers
+        if mid - dividers[-1] > min_tile_w:
             dividers.append(mid)
     dividers.append(grid_x2)
     return dividers
 
 
 def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
-    """Estimate left/right extents of the kiosk item grid.
-
-    Grid starts at ~3 % from left, ends at ~52 % (left of the info/sell panel).
-    """
+    """Estimate left/right extents of the kiosk item grid (resolution-relative)."""
     w = arr.shape[1]
-    return int(w * 0.03), int(w * 0.52)
+    # Grid: left ~2.3%, right ~51.7% (left of the sell/info panel)
+    return int(w * 0.023), int(w * 0.517)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Image pre-processing for a single tile name crop
+Image pre-processing
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _preprocess_tile(crop: Image) -> Image:
@@ -191,7 +196,7 @@ def _preprocess_tile(crop: Image) -> Image:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OCR one tile name crop
+OCR
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _ocr_tile(tile_img: Image) -> str:
@@ -200,7 +205,7 @@ def _ocr_tile(tile_img: Image) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Text cleaning
+Text cleaning
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _clean_line(line: str) -> str:
@@ -210,7 +215,7 @@ def _clean_line(line: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fuzzy matching against database
+Fuzzy matching
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _match_item(raw_name: str) -> tuple[str | None, float]:
@@ -249,7 +254,7 @@ def _match_item(raw_name: str) -> tuple[str | None, float]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Recommendation logic
+Recommendation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _recommendation(price: dict) -> str:
@@ -270,20 +275,10 @@ def _recommendation(price: dict) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main public function
+Main public function
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_kiosk(image: Image) -> list[dict]:
-    """
-    Parse a Ducat Kiosk screenshot and return pricing data for every visible item.
-
-    Args:
-        image: PIL Image of the kiosk screen (any resolution, RGB or greyscale).
-
-    Returns:
-        List of dicts, one per unique matched item, ordered by appearance.
-        Items that OCR found but could not match are included with zeroed prices.
-    """
     img_rgb = image.convert("RGB")
     arr = np.array(img_rgb)
 
@@ -298,7 +293,7 @@ def parse_kiosk(image: Image) -> list[dict]:
 
         for i in range(len(tile_cols) - 1):
             tx1, tx2 = tile_cols[i], tile_cols[i + 1]
-            if tx2 - tx1 < 40:
+            if tx2 - tx1 < max(40, int(arr.shape[1] * 0.04)):
                 continue
 
             crop      = img_rgb.crop((tx1, y1, tx2, y2))
@@ -350,7 +345,7 @@ def parse_kiosk(image: Image) -> list[dict]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLI entry-point
+CLI entry-point
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

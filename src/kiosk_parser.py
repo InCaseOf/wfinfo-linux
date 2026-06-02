@@ -36,15 +36,12 @@ Output: JSON list of objects, one per detected unique item, ordered by appearanc
 import json
 import re
 import sys
-from itertools import groupby
-from operator import itemgetter
 from pathlib import Path
 
 import Levenshtein as lev
 import numpy as np
 import PIL.Image as Img
 from PIL.Image import Image
-from PIL import ImageEnhance, ImageFilter
 from tesserocr import PyTessBaseAPI, PSM
 
 import database as db
@@ -94,15 +91,15 @@ _SUBSTITUTIONS: dict[str, str] = {
     "Baz4":       "Baza",
 }
 
-_PRIME_RE  = re.compile(r"\bPr[il1]me\b", re.IGNORECASE)
-_NOISE_RE  = re.compile(r"[^A-Za-z2 ]")
+_PRIME_RE = re.compile(r"\bPr[il1]me\b", re.IGNORECASE)
+_NOISE_RE = re.compile(r"[^A-Za-z2 ]")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Grid geometry detection
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
-    """Return (start, end) index pairs for contiguous True runs in a 1-D boolean array."""
+    """Return (start, end) pairs for contiguous True runs in a 1-D boolean array."""
     runs = []
     in_run = False
     start = 0
@@ -120,36 +117,32 @@ def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
 
 def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
     """
-    Find horizontal bands that contain item name labels.
+    Find horizontal bands containing item name labels (white text on dark bg).
 
-    Name labels are white text (~RGB > 180) on a dark background.
-    We look for horizontal runs with a high density of white pixels
-    within the kiosk grid x-range.
+    Filters out:
+      - The top 25 % of the image (UI chrome: title bar, sort controls)
+      - Any band shorter than 10 px (quantity badges, thin decorations)
     """
-    h, w = arr.shape[:2]
+    h = arr.shape[0]
     region = arr[:, grid_x1:grid_x2, :]
     white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
-    white_per_row = white.sum(axis=1).astype(float)
+    norm = white.sum(axis=1).astype(float) / (grid_x2 - grid_x1)
 
-    # Normalise by width so threshold is resolution-independent
-    norm = white_per_row / (grid_x2 - grid_x1)
-    # Name rows have >4 % white pixels (text density)
-    text_rows = norm > 0.04
+    raw_runs = _find_runs(norm > 0.04, min_run=8)
 
-    raw_runs = _find_runs(text_rows, min_run=8)
-
-    # Merge runs that are very close (within 15 px — handles two-line names)
-    merged: list[tuple[int, int]] = []
+    # Merge runs within 15 px (handles two-line item names)
+    merged: list[list[int]] = []
     for s, e in raw_runs:
         if merged and s - merged[-1][1] <= 15:
-            merged[-1] = (merged[-1][0], e)
+            merged[-1][1] = e
         else:
-            merged.append((s, e))
+            merged.append([s, e])
 
-    # Skip the very top of the image (header / "PRIME PARTS" title)
-    merged = [(s, e) for s, e in merged if s > h * 0.15]
-
-    return merged
+    # Drop UI chrome (top 25 %) and thin artefacts (< 10 px tall)
+    return [
+        (s, e) for s, e in merged
+        if s > h * 0.25 and (e - s) >= 10
+    ]
 
 
 def _detect_tile_cols(arr: np.ndarray, row_y1: int, row_y2: int,
@@ -157,41 +150,31 @@ def _detect_tile_cols(arr: np.ndarray, row_y1: int, row_y2: int,
     """
     Find vertical tile column boundaries within a name-label row.
 
-    Between tiles there is a narrow dark gap.  We find dark vertical stripes
-    (< 5 % white pixels in the name row height) and use their centres as
-    dividers.  Returns a sorted list of x-coordinates including the outer edges.
+    Tile separators are narrow dark gaps (<5 % white in that column slice).
+    Returns sorted x-coordinates including the outer left/right edges.
     """
     region = arr[row_y1:row_y2, grid_x1:grid_x2, :]
     white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
-    white_per_col = white.sum(axis=0).astype(float) / (row_y2 - row_y1)
+    white_per_col = white.sum(axis=0).astype(float) / max(row_y2 - row_y1, 1)
 
-    dark_cols = white_per_col < 0.05
-    gap_runs = _find_runs(dark_cols, min_run=3)
+    gap_runs = _find_runs(white_per_col < 0.05, min_run=3)
 
     dividers = [grid_x1]
     for gs, ge in gap_runs:
         mid = grid_x1 + (gs + ge) // 2
-        # Only accept dividers that are not too close to an existing one
-        if mid - dividers[-1] > 50:
+        if mid - dividers[-1] > 50:   # ignore slivers
             dividers.append(mid)
     dividers.append(grid_x2)
-
     return dividers
 
 
 def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
-    """
-    Estimate the left/right extents of the kiosk item grid.
+    """Estimate left/right extents of the kiosk item grid.
 
-    The kiosk grid sits left of the info panel.  We look for the rightmost
-    consistently dark vertical stripe (the scrollbar / panel separator) and
-    use that as grid_x2.  grid_x1 is estimated as 3 % of image width.
+    Grid starts at ~3 % from left, ends at ~52 % (left of the info/sell panel).
     """
     w = arr.shape[1]
-    # Rough heuristic: grid occupies left ~55 % of screen
-    grid_x1 = int(w * 0.03)
-    grid_x2 = int(w * 0.55)
-    return grid_x1, grid_x2
+    return int(w * 0.03), int(w * 0.52)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -199,11 +182,10 @@ def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _preprocess_tile(crop: Image) -> Image:
-    """Upscale 3×, greyscale, boost contrast, threshold to BW for clean SINGLE_LINE OCR."""
+    """3× upscale + hard binarise for clean PSM.SINGLE_LINE OCR."""
     w, h = crop.size
     crop = crop.resize((w * 3, h * 3), Img.LANCZOS)
     gray = np.array(crop.convert("L"))
-    # Binarise: white text on dark bg → keep pixels above threshold as white
     binary = (gray > 140).astype(np.uint8) * 255
     return Img.fromarray(binary)
 
@@ -213,7 +195,6 @@ def _preprocess_tile(crop: Image) -> Image:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _ocr_tile(tile_img: Image) -> str:
-    """Run Tesseract SINGLE_LINE on a pre-processed tile name crop."""
     _tess.SetImage(tile_img)
     return _tess.GetUTF8Text().strip()
 
@@ -251,7 +232,6 @@ def _match_item(raw_name: str) -> tuple[str | None, float]:
     assembled = " ".join(corrected_words)
     if assembled in db.items:
         return assembled, 0.9
-
     if not assembled.endswith("Blueprint") and assembled + " Blueprint" in db.items:
         return assembled + " Blueprint", 0.85
 
@@ -318,19 +298,15 @@ def parse_kiosk(image: Image) -> list[dict]:
 
         for i in range(len(tile_cols) - 1):
             tx1, tx2 = tile_cols[i], tile_cols[i + 1]
-            if tx2 - tx1 < 40:          # skip slivers
+            if tx2 - tx1 < 40:
                 continue
 
-            crop = img_rgb.crop((tx1, y1, tx2, y2))
+            crop      = img_rgb.crop((tx1, y1, tx2, y2))
             processed = _preprocess_tile(crop)
             raw_text  = _ocr_tile(processed)
             cleaned   = _clean_line(raw_text)
 
-            if not cleaned or len(cleaned) < 4:
-                continue
-
-            # If it doesn't look like a Prime item at all, skip
-            if not _PRIME_RE.search(cleaned):
+            if not cleaned or len(cleaned) < 4 or not _PRIME_RE.search(cleaned):
                 continue
 
             canonical, confidence = _match_item(cleaned)

@@ -1,18 +1,22 @@
 """Kiosk parser -- OCR-scans a Ducat Kiosk screenshot and returns price data for every
 visible Prime part.
 
-Strategy:
-  1. Detect the horizontal name-label bands using white-pixel density.
-  2. Split the grid width evenly into 6 columns (Warframe kiosk is always 6-wide).
-  3. OCR each tile name crop with PSM.SINGLE_LINE at 3x upscale.
+Detection strategy:
+  1. Find inter-row separator bands: rows where the full grid width is nearly all
+     dark (lum < 8 across >90% of pixels). These are the black strips between tile rows.
+  2. Tile rows = the spans between those separator bands (filter < 50px tall).
+  3. Name label crop = bottom 85px (scaled) of each tile row. Names are bottom-aligned.
+  4. 6 fixed equal-width columns (Warframe kiosk is always 6-wide).
+  5. Binarize on luminance > 100 (text is warm grey ~lum 156, not pure white).
+  6. OCR with Tesseract PSM.SINGLE_LINE at 3x upscale.
 
-All geometry thresholds scale with image dimensions for resolution independence.
+All geometry scales with image dimensions for resolution independence.
 
 Usage::
 
     python kiosk_parser.py <screenshot_path>
 
-Output: JSON list of objects, one per detected unique item::
+Output: JSON list per visible item::
 
     {
         "name":           str,
@@ -92,14 +96,18 @@ _NOISE_RE = re.compile(r"[^A-Za-z2 ]")
 # Warframe kiosk always shows exactly 6 columns
 _KIOSK_COLS = 6
 
+# Name label sits in the bottom N pixels of each tile (bottom-aligned text)
+# Scales with image height: ~85px at 1080p, ~113px at 1440p
+_NAME_BOTTOM_FRAC = 0.079   # 85/1080
+
 
 # ---------------------------------------------------------------------------
-# Grid geometry detection
+# Grid geometry
 # ---------------------------------------------------------------------------
 
 def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
     """Return (start, end) pairs for contiguous True runs in a 1-D boolean array."""
-    runs = []
+    runs: list[tuple[int, int]] = []
     in_run = False
     start = 0
     for i, v in enumerate(mask_1d):
@@ -115,67 +123,94 @@ def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
 
 
 def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
-    """Estimate left/right extents of the kiosk item grid (resolution-relative)."""
-    w = arr.shape[1]
-    # Grid starts at ~2.3% from left, ends at ~51.7% (left of sell/info panel)
-    return int(w * 0.023), int(w * 0.517)
-
-
-def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
     """
-    Find horizontal bands containing item name labels (white text on dark bg).
-    All thresholds scale with image height for resolution independence.
+    Return (grid_x1, grid_x2): the horizontal extent of the item grid.
+
+    Scans for the rightmost near-full-height dark vertical column (left panel
+    boundary) and uses fixed ~2.3% for the left edge.
+    """
+    h, w = arr.shape[:2]
+    x1 = int(w * 0.023)
+
+    # Right boundary: find rightmost column that is mostly dark in the grid region
+    scan_y = slice(int(h * 0.15), int(h * 0.85))
+    for x in range(int(w * 0.58), int(w * 0.30), -1):
+        col = arr[scan_y, x, :]
+        lum = 0.299 * col[:, 0] + 0.587 * col[:, 1] + 0.114 * col[:, 2]
+        if (lum < 40).mean() > 0.85:
+            return x1, x
+
+    return x1, int(w * 0.517)  # fallback
+
+
+def _detect_tile_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
+    """
+    Find tile rows by locating fully-dark horizontal separator bands.
+
+    The black strips between tile rows are nearly 100% dark across the full
+    grid width -- a much more reliable signal than text density.
     """
     h = arr.shape[0]
-    region = arr[:, grid_x1:grid_x2, :]
-    white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
-    norm = white.sum(axis=1).astype(float) / (grid_x2 - grid_x1)
+    grid_w = grid_x2 - grid_x1
 
-    min_run = max(6, int(h * 0.007))
-    raw_runs = _find_runs(norm > 0.04, min_run=min_run)
+    row_dark = np.array([
+        (
+            0.299 * arr[y, grid_x1:grid_x2, 0] +
+            0.587 * arr[y, grid_x1:grid_x2, 1] +
+            0.114 * arr[y, grid_x1:grid_x2, 2]
+        ).mean()
+        for y in range(h)
+    ])
 
-    # Merge runs within h*0.04 (two-line names, slight gaps)
-    merge_gap = int(h * 0.04)
-    merged: list[list[int]] = []
-    for s, e in raw_runs:
-        if merged and s - merged[-1][1] <= merge_gap:
-            merged[-1][1] = e
-        else:
-            merged.append([s, e])
+    # Separator: full row mean lum < 8 (the pure black inter-row gaps)
+    is_sep = row_dark < 8
+    sep_runs = _find_runs(is_sep, min_run=5)
 
-    # Drop UI chrome (top 30%) and thin artefacts
-    min_height = max(10, int(h * 0.01))
-    return [
-        (s, e) for s, e in merged
-        if s > h * 0.30 and (e - s) >= min_height
-    ]
+    # Only keep separators wide enough to be true inter-row gaps (> h*0.01)
+    min_sep = max(8, int(h * 0.01))
+    wide_seps = [(s, e) for s, e in sep_runs if e - s >= min_sep]
+
+    # Tile rows are the spans between consecutive wide separators
+    min_tile_h = max(50, int(h * 0.05))
+    tile_rows: list[tuple[int, int]] = []
+    for i in range(len(wide_seps) - 1):
+        row_start = wide_seps[i][1] + 1
+        row_end   = wide_seps[i + 1][0] - 1
+        if row_end - row_start >= min_tile_h:
+            tile_rows.append((row_start, row_end))
+
+    return tile_rows
 
 
-def _tile_x_bounds(grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
+def _tile_x_bounds(grid_x1: int, grid_x2: int, w: int) -> list[tuple[int, int]]:
     """
-    Return (x1, x2) for each of the 6 tile columns, with a 10% inset on each
-    side to avoid reading border artifacts.
+    Return (x1, x2) for each of the 6 tile columns.
+    A small inset avoids the tile border frame artifacts.
     """
     tile_w = (grid_x2 - grid_x1) / _KIOSK_COLS
-    bounds = []
-    for i in range(_KIOSK_COLS):
-        x1 = int(grid_x1 + i * tile_w)
-        x2 = int(grid_x1 + (i + 1) * tile_w)
-        inset = max(4, int((x2 - x1) * 0.10))
-        bounds.append((x1 + inset, x2 - inset))
-    return bounds
+    inset = max(4, int(tile_w * 0.05))
+    return [
+        (int(grid_x1 + i * tile_w) + inset,
+         int(grid_x1 + (i + 1) * tile_w) - inset)
+        for i in range(_KIOSK_COLS)
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Image pre-processing
 # ---------------------------------------------------------------------------
 
-def _preprocess_tile(crop: Image) -> Image:
-    """3x upscale + hard binarise for clean PSM.SINGLE_LINE OCR."""
-    w, h = crop.size
-    crop = crop.resize((w * 3, h * 3), Img.LANCZOS)
+def _preprocess_tile(crop: Image, h_img: int) -> Image:
+    """
+    3x upscale + binarize on luminance > 100.
+
+    Item name text is warm grey (~lum 156), not pure white, so we threshold
+    on luminance rather than per-channel RGB.
+    """
+    cw, ch = crop.size
+    crop = crop.resize((cw * 3, ch * 3), Img.LANCZOS)
     gray = np.array(crop.convert("L"))
-    binary = (gray > 140).astype(np.uint8) * 255
+    binary = (gray > 100).astype(np.uint8) * 255
     return Img.fromarray(binary)
 
 
@@ -266,18 +301,25 @@ def parse_kiosk(image: Image) -> list[dict]:
     """Parse a Ducat Kiosk screenshot and return pricing data for every visible item."""
     img_rgb = image.convert("RGB")
     arr = np.array(img_rgb)
+    h, w = arr.shape[:2]
 
     grid_x1, grid_x2 = _infer_grid_x(arr)
-    name_rows = _detect_name_rows(arr, grid_x1, grid_x2)
-    tile_cols = _tile_x_bounds(grid_x1, grid_x2)
+    tile_rows = _detect_tile_rows(arr, grid_x1, grid_x2)
+    tile_cols = _tile_x_bounds(grid_x1, grid_x2, w)
+
+    # Name label height: bottom N px of each tile (scales with resolution)
+    name_h = max(60, int(h * _NAME_BOTTOM_FRAC))
 
     results: list[dict] = []
     seen:    set[str]   = set()
 
-    for y1, y2 in name_rows:
+    for ry1, ry2 in tile_rows:
+        name_y1 = ry2 - name_h
+        name_y2 = ry2
+
         for tx1, tx2 in tile_cols:
-            crop      = img_rgb.crop((tx1, y1, tx2, y2))
-            processed = _preprocess_tile(crop)
+            crop      = img_rgb.crop((tx1, name_y1, tx2, name_y2))
+            processed = _preprocess_tile(crop, h)
             raw_text  = _ocr_tile(processed)
             cleaned   = _clean_line(raw_text)
 
@@ -353,6 +395,6 @@ if __name__ == "__main__":
     print(f"  Matched:   {len(matched)}")
     print(f"  Unmatched: {len(unmatched)}")
     if unmatched:
-        print(f"  Unmatched raw OCR lines:")
+        print("  Unmatched raw OCR lines:")
         for u in unmatched:
             print(f"    . '{u['raw']}'")

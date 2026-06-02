@@ -1,35 +1,26 @@
 """Kiosk parser -- OCR-scans a Ducat Kiosk screenshot and returns price data for every
 visible Prime part.
 
-Strategy: instead of OCR-ing the full image (which causes item art to be read as
-garbage text), we:
-  1. Detect the horizontal bands where item name labels sit, using white-pixel
-     density (names are bright text on a dark background).
-  2. Detect vertical tile column boundaries using the same method.
-  3. OCR each individual tile name crop with PSM.SINGLE_LINE at 3x upscale.
+Strategy:
+  1. Detect the horizontal name-label bands using white-pixel density.
+  2. Split the grid width evenly into 6 columns (Warframe kiosk is always 6-wide).
+  3. OCR each tile name crop with PSM.SINGLE_LINE at 3x upscale.
 
-All geometry thresholds are expressed as fractions of image dimensions so the
-detection works at any resolution (1080p, 1440p, 4K, ultrawide, etc.).
+All geometry thresholds scale with image dimensions for resolution independence.
 
-Usage (standalone)::
+Usage::
 
     python kiosk_parser.py <screenshot_path>
 
-Output: JSON list of objects, one per detected unique item, ordered by appearance::
+Output: JSON list of objects, one per detected unique item::
 
     {
         "name":           str,
         "raw":            str,
         "matched":        bool,
         "confidence":     float,
-        "price": {
-            "platinum":   float,
-            "ducats":     int
-        },
-        "sold": {
-            "today":      int,
-            "yesterday":  int
-        },
+        "price":          {"platinum": float, "ducats": int},
+        "sold":           {"today": int, "yesterday": int},
         "vaulted":        bool | "partial",
         "recommendation": "plat" | "ducats" | "either"
     }
@@ -98,6 +89,9 @@ _SUBSTITUTIONS: dict[str, str] = {
 _PRIME_RE = re.compile(r"\bPr[il1]me\b", re.IGNORECASE)
 _NOISE_RE = re.compile(r"[^A-Za-z2 ]")
 
+# Warframe kiosk always shows exactly 6 columns
+_KIOSK_COLS = 6
+
 
 # ---------------------------------------------------------------------------
 # Grid geometry detection
@@ -120,21 +114,27 @@ def _find_runs(mask_1d: np.ndarray, min_run: int = 1) -> list[tuple[int, int]]:
     return runs
 
 
+def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
+    """Estimate left/right extents of the kiosk item grid (resolution-relative)."""
+    w = arr.shape[1]
+    # Grid starts at ~2.3% from left, ends at ~51.7% (left of sell/info panel)
+    return int(w * 0.023), int(w * 0.517)
+
+
 def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
     """
     Find horizontal bands containing item name labels (white text on dark bg).
-    All thresholds scale with image height so detection works at any resolution.
+    All thresholds scale with image height for resolution independence.
     """
     h = arr.shape[0]
     region = arr[:, grid_x1:grid_x2, :]
     white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
     norm = white.sum(axis=1).astype(float) / (grid_x2 - grid_x1)
 
-    # min_run scales with height: ~8px at 1080p, ~11px at 1440p
     min_run = max(6, int(h * 0.007))
     raw_runs = _find_runs(norm > 0.04, min_run=min_run)
 
-    # Merge runs within h*0.04 px (handles two-line names at any resolution)
+    # Merge runs within h*0.04 (two-line names, slight gaps)
     merge_gap = int(h * 0.04)
     merged: list[list[int]] = []
     for s, e in raw_runs:
@@ -143,7 +143,7 @@ def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple
         else:
             merged.append([s, e])
 
-    # Drop UI chrome (top 30%) and thin artefacts (< h*0.01 tall)
+    # Drop UI chrome (top 30%) and thin artefacts
     min_height = max(10, int(h * 0.01))
     return [
         (s, e) for s, e in merged
@@ -151,32 +151,19 @@ def _detect_name_rows(arr: np.ndarray, grid_x1: int, grid_x2: int) -> list[tuple
     ]
 
 
-def _detect_tile_cols(arr: np.ndarray, row_y1: int, row_y2: int,
-                      grid_x1: int, grid_x2: int) -> list[int]:
-    """Find vertical tile column boundaries within a name-label row."""
-    w = arr.shape[1]
-    region = arr[row_y1:row_y2, grid_x1:grid_x2, :]
-    white = (region[:, :, 0] > 170) & (region[:, :, 1] > 170) & (region[:, :, 2] > 170)
-    white_per_col = white.sum(axis=0).astype(float) / max(row_y2 - row_y1, 1)
-
-    gap_runs = _find_runs(white_per_col < 0.05, min_run=3)
-
-    # Min tile width scales with resolution (~50px at 1080p, ~130px at 2560p)
-    min_tile_w = max(50, int(w * 0.05))
-    dividers = [grid_x1]
-    for gs, ge in gap_runs:
-        mid = grid_x1 + (gs + ge) // 2
-        if mid - dividers[-1] > min_tile_w:
-            dividers.append(mid)
-    dividers.append(grid_x2)
-    return dividers
-
-
-def _infer_grid_x(arr: np.ndarray) -> tuple[int, int]:
-    """Estimate left/right extents of the kiosk item grid (resolution-relative)."""
-    w = arr.shape[1]
-    # Grid: left ~2.3%, right ~51.7% (left of the sell/info panel)
-    return int(w * 0.023), int(w * 0.517)
+def _tile_x_bounds(grid_x1: int, grid_x2: int) -> list[tuple[int, int]]:
+    """
+    Return (x1, x2) for each of the 6 tile columns, with a 10% inset on each
+    side to avoid reading border artifacts.
+    """
+    tile_w = (grid_x2 - grid_x1) / _KIOSK_COLS
+    bounds = []
+    for i in range(_KIOSK_COLS):
+        x1 = int(grid_x1 + i * tile_w)
+        x2 = int(grid_x1 + (i + 1) * tile_w)
+        inset = max(4, int((x2 - x1) * 0.10))
+        bounds.append((x1 + inset, x2 - inset))
+    return bounds
 
 
 # ---------------------------------------------------------------------------
@@ -282,18 +269,13 @@ def parse_kiosk(image: Image) -> list[dict]:
 
     grid_x1, grid_x2 = _infer_grid_x(arr)
     name_rows = _detect_name_rows(arr, grid_x1, grid_x2)
+    tile_cols = _tile_x_bounds(grid_x1, grid_x2)
 
     results: list[dict] = []
     seen:    set[str]   = set()
 
     for y1, y2 in name_rows:
-        tile_cols = _detect_tile_cols(arr, y1, y2, grid_x1, grid_x2)
-
-        for i in range(len(tile_cols) - 1):
-            tx1, tx2 = tile_cols[i], tile_cols[i + 1]
-            if tx2 - tx1 < max(40, int(arr.shape[1] * 0.04)):
-                continue
-
+        for tx1, tx2 in tile_cols:
             crop      = img_rgb.crop((tx1, y1, tx2, y2))
             processed = _preprocess_tile(crop)
             raw_text  = _ocr_tile(processed)
